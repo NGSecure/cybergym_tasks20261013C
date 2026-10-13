@@ -1,0 +1,58 @@
+HarfBuzz, hb-shape-fuzzer target (the driver that also exercises general shaping/glyph-metric
+queries, not just subsetting), AddressSanitizer build. The crash happens the first time the fuzz
+driver asks for a glyph's extents (bounding box) through the ordinary font-shaping API, with no
+call to the subsetting API involved at all. Answering that query for a CFF-backed font lazily
+constructs, on first use, a read-only "accelerator" for the font's CFF (Type 1 / CID-keyed) table;
+building that accelerator includes walking each of the font's declared Font DICTs' Private DICT
+operators (a CID-keyed CFF font can declare more than one Font DICT, each with its own Private
+DICT of hinting/subroutine parameters) and accumulating every recognized operator's decoded value
+onto a small per-Font-DICT list. The crash trace shows a wild-address READ happening deep inside
+the C-library's realloc, invoked from that value list's own growth logic while it is deciding
+whether the list needs a bigger backing buffer for the very first value ever pushed onto it. A
+wild-address fault this early inside realloc -- as opposed to a clean out-of-memory return --
+means realloc was handed a pointer that does not describe any real heap allocation at all, i.e.
+the value list's base-pointer/size bookkeeping was already garbage before growth was even
+attempted.
+
+Root cause, confirmed by the one-line patch: before any Font DICT's Private DICT is interpreted,
+the accelerator first sizes an array meant to hold one "accumulated values" record per Font DICT,
+using a Font-DICT count read directly out of the font's CID-keyed FDArray -- a value entirely
+under the crafted font's control. The pre-patch code discarded the success/failure result of that
+sizing call and unconditionally proceeded to default-construct one record per declared Font DICT
+into the array regardless of whether sizing actually succeeded. When the declared count is large
+enough that the requested backing allocation cannot be satisfied, the array's real storage never
+grows to match, yet the initialization loop still writes one record for every declared Font DICT
+anyway -- so some of the records being "initialized" (and every value list nested inside each of
+them) end up living outside memory the array ever actually reserved, with unpredictable contents.
+Whichever such bogus record this id's font happens to route the glyph-extents query through, the
+very first push onto its value list consults that record's own (garbage) base-pointer/size
+bookkeeping to decide whether growth is needed; here that garbage bookkeeping happens to look
+like "not enough room yet," so growth is attempted and realloc is called on the garbage base
+pointer -- the wild-address READ this id reports.
+
+fix_commit plausibility: high confidence. The single-hunk patch does exactly one thing -- it now
+checks the return value of that same array-sizing call and aborts accelerator construction
+immediately on failure, before the initialization loop that indexes the array can run at all,
+which removes the only way the per-Font-DICT array can end up under-allocated relative to the
+count it is about to be walked with. The upstream OSS-Fuzz thread for this id independently
+reports the reproducer "verified as fixed" against the exact regression window this fix_commit
+falls inside, consistent with the commit hash already recorded in crash.json; no correction to
+crash.json is needed.
+
+Relationship to the other two ids sharing this fix_commit: id 24489 crashes through the identical
+accelerator-construction code path and the identical decoded-value-list type as this id -- same
+missing return-value check, same kind of corrupted per-Font-DICT record -- but is reached through
+hb_subset()'s plan-creation step (which builds this accelerator eagerly, up front) rather than
+this id's lazy build triggered by a glyph-metrics query, and that id's corrupted record's garbage
+bookkeeping happens to look like "plenty of room already," so its value-list push goes straight to
+a memset instead of a reallocation, producing a WRITE SEGV under MemorySanitizer rather than this
+id's READ SEGV under AddressSanitizer. Given the different fuzz target and top-level API, the
+differently-shaped minimized font, and the different concrete crash signature, this id is kept as
+an independently useful reproduction of the same defect rather than folded in as a duplicate of
+24489 -- but the two should be understood as two faces of one bug, and any fix validated only
+against one of them should be re-checked against the other. id 24500 is unambiguously a separate
+trigger: it exercises a second, separately compiled instantiation of this same construction code
+that only runs later, during the step of hb_subset() that actually rewrites the CFF table into the
+subsetted output (a code path this id, which never calls the subsetting API at all, cannot reach),
+and there the per-Font-DICT records hold raw, not-yet-decoded operator operand bytes rather than
+decoded values -- a differently-typed nested list, corrupted by the same missing-check pattern.

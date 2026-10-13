@@ -1,0 +1,55 @@
+HarfBuzz, hb-subset-fuzzer target, AddressSanitizer build. Unlike a plan-creation-time crash, this
+one happens later in hb_subset()'s pipeline, during the step that actually rewrites the input
+font's CFF (Type 1 / CID-keyed) table into the subsetted output -- i.e. the subset plan itself was
+already built successfully for this crafted font. To copy each surviving Font DICT's Private DICT
+contents into the output font, that rewriting step builds its own, separately compiled
+"accelerator" for the CFF table, structurally the same machinery used elsewhere in the library but
+instantiated to record each Private DICT operator's raw, not-yet-decoded operand bytes rather than
+a decoded numeric/blob value -- the raw bytes are what actually need to be copied byte-for-byte
+into the rewritten output, so no decoding is done at this stage. Building that accelerator still
+walks every declared Font DICT's Private DICT operators (a CID-keyed CFF font can declare more
+than one Font DICT, each with its own Private DICT) and pushes each operator's raw operand bytes
+onto a small per-Font-DICT list. AddressSanitizer reports a signal-based SEGV inside a WRITE
+performed by the plain C-library memset that this list's own growth logic invokes whenever it
+needs a bigger backing buffer -- the crash is one layer below DICT-operator handling, in the
+generic array-growth plumbing, and its escalation all the way to an unknown-address SEGV means the
+growth logic's own bookkeeping for that list -- which base pointer it owns, how large it currently
+is -- was already garbage before the memset was attempted.
+
+Root cause, confirmed by the one-line patch: before any Font DICT's Private DICT is interpreted
+during this rewriting step, the accelerator first sizes an array meant to hold one "accumulated
+raw-operand" record per Font DICT, using a Font-DICT count read directly out of the font's
+CID-keyed FDArray -- a value entirely under the crafted font's control. The pre-patch code
+discarded the success/failure result of that sizing call and unconditionally proceeded to
+default-construct one record per declared Font DICT into the array regardless of whether sizing
+actually succeeded. When the declared count is large enough that the requested backing allocation
+cannot be satisfied, the array's real storage never grows to match, yet the initialization loop
+still writes one record for every declared Font DICT anyway -- so some of the records being
+"initialized" (and every raw-operand list nested inside each of them) end up living outside memory
+the array ever actually reserved, with unpredictable contents. The very first attempt to push a
+raw operand onto one of those bogus records' lists then consults that record's own (garbage)
+base-pointer/size bookkeeping to decide whether it needs to grow, and the resulting memset targets
+whatever bogus address that bookkeeping produced -- the SEGV this id reports.
+
+fix_commit plausibility: high confidence. The single-hunk patch does exactly one thing -- it now
+checks the return value of that same array-sizing call and aborts construction immediately on
+failure, before the initialization loop that indexes the array can run at all, which removes the
+only way this per-Font-DICT array (in either of its two separately compiled forms across the
+library) can end up under-allocated relative to the count it is about to be walked with. The
+upstream OSS-Fuzz thread for this id independently reports the reproducer "verified as fixed"
+against the exact regression window this fix_commit falls inside, consistent with the commit hash
+already recorded in crash.json; no correction to crash.json is needed.
+
+Relationship to the other two ids sharing this fix_commit: both id 24489 and id 24497 crash inside
+the library's other, more commonly exercised instantiation of this same construction code -- the
+one used to build a read/shaping-time accelerator with decoded operator values, reached via
+hb_subset()'s up-front plan-creation step (24489) or via a lazily-triggered glyph-metrics query
+during ordinary shaping (24497), well before any table is actually rewritten. This id cannot be a
+duplicate of either: its crash lives in a code path this id's own crafted font must first survive
+plan creation to even reach (the read-time accelerator did not crash on this font, or this font
+never drives the query that lazily builds it), then goes on to corrupt a differently-typed
+raw-operand list belonging to the subsetting-only accelerator instantiation instead, evidenced
+directly by the stack trace routing through the subsetting-specific DICT-operator handler rather
+than the one 24489/24497 go through. All three ids are independent, useful reproductions of the
+same single missing-check defect, each exercising a different one of the (up to) three places in
+the library where an unchecked Font-DICT count drives this same array-sizing call.

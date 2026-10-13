@@ -1,0 +1,54 @@
+In nDPI's shared packet-processing library (the common per-packet ingestion
+routine used both by the reference reader tool and by the fuzz harness,
+which calls it directly to feed raw captured bytes into the detection
+engine), AddressSanitizer reports a 1-byte heap-buffer-overflow READ that
+lands exactly at the end of the heap buffer holding the captured packet's
+raw bytes, while the routine is inspecting the frame's data-link header to
+figure out which network-layer protocol follows.
+
+Root cause: for captures whose data-link type is the synchronous-serial /
+Cisco-HDLC-style PPP framing (DLT_C_HDLC / DLT_PPP), the routine
+unconditionally assumes every such capture carries a fixed 4-byte framing
+header -- one address byte, one control byte, and a 2-byte protocol-type
+field -- and reads that 2-byte protocol-type field straight out of the raw
+packet buffer at the offset immediately following those two leading bytes.
+In reality, captures of this data-link type come in two mutually exclusive
+shapes: genuinely HDLC-framed captures (identifiable by one of a couple of
+specific fixed values -- covering both possible address-field senses -- in
+the very first byte) that do carry those two leading bytes before
+the protocol field, and header-less raw-PPP captures that place the 2-byte
+protocol-type field at the very start of the frame instead, with no leading
+address/control bytes at all. The routine never distinguishes between the
+two shapes, so a header-less capture has its protocol-type field read from
+an offset that presumes two extra leading bytes were captured when they
+never were. When such a capture's total captured length is short enough
+that this presumed offset runs past the buffer's last valid byte, one byte
+of the 2-byte protocol-type read falls exactly one past the end of the
+allocation, producing the observed overflow.
+
+The fix inspects the very first byte of the frame before deciding how to
+interpret it: only when that byte carries one of the specific values that
+mark a genuine 4-byte HDLC-style header does the routine keep reading the
+protocol-type field from the offset behind that header; otherwise it treats
+the capture as header-less PPP and reads the 2-byte protocol-type field
+directly from the start of the frame, with no offset applied.
+
+fix_commit plausibility: highly plausible. The recorded fix touches this
+exact per-packet ingestion routine's data-link-type dispatch, in the
+identical Cisco-HDLC/PPP case that both computes the offset used for the
+protocol-type read and sits on the crash's own call stack as the direct
+caller of the faulting read. The accompanying change also adds one new
+regression test capture (raw data, not source) exercising precisely this
+PPP data-link type -- exactly the kind of addition expected alongside a fix
+for this scenario. No line-number or function-name coincidence is being
+relied on here: the mechanism the diff changes is the same mechanism the
+crash stack shows executing.
+
+Verdict: not harness-only, despite the touched source file living under the
+project's example/ directory (normally associated with its demo CLI tool).
+The crash stack shows the fuzz target's entry point calling directly into
+this exact routine to process the fuzzer-supplied bytes, so this file's
+data-link dispatch logic is genuinely compiled into and exercised by the
+fuzz target itself, not merely reachable through an unrelated demo binary.
+The fix is a real, product-relevant parsing-correctness fix, not a
+build-script or test-harness-only change.

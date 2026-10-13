@@ -1,0 +1,59 @@
+HarfBuzz, hb-subset-fuzzer target, MemorySanitizer build. The crash happens while hb_subset()
+is building its glyph-retention subset plan, before any actual output-writing work starts: as
+part of that plan-creation step, the API constructs a read-only "accelerator" for the input
+font's CFF (Type 1 / CID-keyed) table so it can inspect, among other things, each glyph's
+associated Font DICT and that Font DICT's own Private DICT (a CID-keyed CFF font can declare more
+than one Font DICT -- one per group of glyphs -- and each carries an independent Private DICT of
+hinting/subroutine parameters). Building the accelerator walks a given Private DICT's operators
+one at a time and, for every operator it recognizes, pushes a small decoded value object onto a
+per-Font-DICT list that accumulates those values. MemorySanitizer reports a signal-based SEGV
+inside a WRITE performed by the plain C-library memset that this value list's own growth logic
+invokes whenever it needs a larger backing buffer -- i.e. the crash is not in DICT-operator
+parsing itself but one layer below it, in the generic array-growth plumbing shared by every such
+list, and the fact that MSan escalates this all the way to an unknown-address SEGV (rather than a
+plain uninitialized-value warning) means the growth logic's own bookkeeping for that array --
+which base pointer it currently owns, how large it currently is -- was already garbage before the
+memset was ever attempted.
+
+Root cause, confirmed by the one-line patch: before any Font DICT's Private DICT is interpreted,
+the accelerator first sizes an array meant to hold one "accumulated values" record per Font DICT,
+using a Font-DICT count read directly out of the font's CID-keyed FDArray -- a value entirely
+under the crafted font's control. The pre-patch code discarded the success/failure result of that
+sizing call and unconditionally proceeded to default-construct one record per declared Font DICT
+into the array regardless of whether sizing actually succeeded. When the declared count is large
+enough that the requested backing allocation cannot be satisfied, the array's real storage never
+grows to match, yet the initialization loop still writes one record for every declared Font DICT
+anyway -- so some of the records being "initialized" (and every value list nested inside each of
+them) end up living outside memory the array ever actually reserved, with unpredictable contents.
+The very first attempt to push a decoded operator value onto one of those bogus records' value
+lists then consults that record's own (garbage) base-pointer/size bookkeeping to decide whether it
+needs to grow, and the resulting memset targets whatever bogus address that bookkeeping produced --
+the SEGV this id reports.
+
+fix_commit plausibility: high confidence. The single-hunk patch does exactly one thing -- it now
+checks the return value of that same array-sizing call and aborts accelerator construction
+immediately on failure, before the initialization loop that indexes the array can run at all,
+which removes the only way the per-Font-DICT array can end up under-allocated relative to the
+count it is about to be walked with. The upstream OSS-Fuzz thread for this id independently
+reports the reproducer "verified as fixed" against the exact regression window this fix_commit
+falls inside, consistent with the commit hash already recorded in crash.json; no correction to
+crash.json is needed.
+
+Relationship to the other two ids sharing this fix_commit: id 24497 crashes through the identical
+accelerator-construction code path and the identical decoded-value-list type as this id -- same
+missing return-value check, same kind of corrupted per-Font-DICT record -- but is reached the
+first time an ordinary glyph-metrics query forces this same CFF accelerator to be built lazily
+during shaping, rather than eagerly during hb_subset()'s plan-creation step, and the corrupted
+record's particular garbage bookkeeping happens to make the growth logic attempt a reallocation
+instead of an immediate memset, so it surfaces as a wild-pointer READ inside the allocator rather
+than a WRITE inside memset. Because it is reached through a different fuzz target and top-level
+API, was minimized from a differently-shaped crafted font, and produces a different concrete
+crash signature, it is kept here as an independently useful reproduction of the same defect rather
+than folded into this id as a byte-for-byte duplicate -- but both should be understood as two
+faces of one bug, and a fix validated only against one of them should be re-checked against the
+other before being trusted. id 24500 is unambiguously a separate trigger: it exercises a second,
+separately compiled instantiation of this same construction code that only runs later, during the
+step of hb_subset() that actually rewrites the CFF table into the subsetted output, and there the
+per-Font-DICT records hold raw, not-yet-decoded operator operand bytes rather than decoded values --
+a differently-typed nested list, corrupted by the same missing-check pattern, reached from a
+call path that this id's own crash never gets to.
